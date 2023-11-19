@@ -15,6 +15,7 @@ add_subdirectory(${MBED_PATH})
 
 add_executable(${APP_TARGET}
     main.cpp
+    MCP23017.cpp
 )
 
 target_link_libraries(${APP_TARGET} mbed-os)
