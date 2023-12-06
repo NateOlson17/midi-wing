@@ -15,6 +15,9 @@ add_subdirectory(${MBED_PATH})
 
 add_executable(${APP_TARGET}
     main.cpp
+    USBMIDI.cpp
+    usbcore.cpp
+    usbdevice.cpp
 )
 
 target_link_libraries(${APP_TARGET} mbed-os)

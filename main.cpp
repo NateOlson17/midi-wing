@@ -1,4 +1,5 @@
 #include "mbed.h"
+#include "USBMIDI.h"
 
 DigitalOut MUX_0(p21);
 DigitalOut MUX_1(p22);
@@ -9,13 +10,14 @@ DigitalIn INT_0A(p13);
 DigitalIn INT_1A(p14);
 DigitalIn INT_2A(p25);
 DigitalIn INT_3A(p26);
-AnalogIn FADER_IN(p20);
+AnalogIn FADER_IN(p20, 3.3);
 
 I2C bus(p28, p27);
 
+USBMIDI midicon;
+
 
 //WIRE INPUTS FOR B SIDE INTERRUPTS AT 11/12/30/29 (maybe move them around for clean wiring)
-//INSTEAD OF WRITEMULTIPLE FUNC, ALLOW REGULAR WRITE FUNC TO ACCEPT 2 BYTES AND TAKE ADVANTAGE OF SEQUENTIAL OPERATION TO WRITE TO BOTH SIDES A/B (make a "both sides" bool parameter? do it by default if 2 bytes sent? bool param is best way, only requires if statement to resend byte) - is it worth it? I will only do this during init....
 
 /*
 Takes device address, register to read, buffer to store value in.
@@ -37,7 +39,7 @@ int readReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
 }
 
 /*
-Takes device address, register to write to, and write data buffer.
+Takes device address, register to write to, write data buffer.
 Returns 0 on success, -n on ACK fail, where nth sent byte was NACK by slave.
 */
 int writeReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
@@ -65,7 +67,7 @@ Configures:
 -Automatic pointer incrementation
 -Interrupts as active LOW
 -Pull up resistors enabled on all pins (will idle high)
-Returns 0 on success, -1 on R/W fail.
+Returns 0 on success, -1 on write fail.
 */
 int busInit() {
     bus.frequency(400000);
@@ -84,19 +86,18 @@ int busInit() {
 int main()
 {
     printf("================\n");
-    FADER_IN.set_reference_voltage(5);
     busInit();
     
     while (true) {
         //check interrupt pins
 
         printf("\n\n----------------\n\n");
-        for (uint8_t mux_addr = 0x00; mux_addr < 0x0f; mux_addr++) {
+        for (uint8_t mux_addr = 0; mux_addr < 16; mux_addr++) {
             MUX_0 = mux_addr & 0x01;
             MUX_1 = mux_addr & 0x02;
             MUX_2 = mux_addr & 0x04;
             MUX_3 = mux_addr & 0x08;
-            printf("A: %x, V: %.4f\n", mux_addr, FADER_IN.read_voltage());
+            printf("A: %i: %.4f\n", mux_addr, FADER_IN.read());
         }
     }
 }
