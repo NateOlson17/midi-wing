@@ -28,9 +28,7 @@ I2C bus(p28, p27);
 USBMIDI midicon;
 
 
-//!Redesign curved parts and get new copy of keyshelf printed
-//!Move first 5 buttons to proper inputs
-//!Figure out why INT is constantly active (INTCON register is always 0x0A? Check what INTCONA/B is before and after IOCON write and GPPU/GPINTEN write. Checking INTF might give more info.)
+//Get interrupts functional
 //Set up battery harness for LEDs
 //Implement sendMSC properly
 //Figure out better fader change detection
@@ -49,7 +47,7 @@ int readReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
         if (bus.write(reg) == 1) { //if register address ack, restart and send next control byte
             bus.start();
             if (bus.write(opcode | 1) == 1) {//send second control byte (opcode with read bit high)
-                *buf = bus.read(1); //read reg into buf and send ack
+                *buf = bus.read(0); //read reg into buf and send ack
                 bus.stop();
                 return 0;
             } else {bus.stop(); return -3;}
@@ -79,38 +77,42 @@ int writeReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
 /*
 Init I2C network.
 Configures:
--All pins as inputs
+-All pins as inputs (except GPA7/GPB7, in datasheet errata they are output only on MCP23017, bidirectional on MCP23S17!)
 -Pin logic state to match input
--All pins enabled for interrupt on change
+-All pins enabled for interrupt on change (except GPA7/GPB7)
 -Interrupt comparison to previous value, not DEFVAL
--Bank addressing
+-Non-banked addressing
 -Internally linked interrupt pins
--Automatic pointer incrementation
+-Automatic pointer incrementation disabled
 -INT as active driver output
 -Interrupts as active LOW
--Pull up resistors enabled on all pins (will idle high)
-Returns 0 on success, -n on write fail. n = 1 for IOCON, 2 for GPPU/GPINTEN, 3 for INTCON.
+-100k pull up resistors enabled on all pins (except GPA7/GPB7)
+Returns 0 on success, -n on write fail. n = 1 for IOCON, 2 for IODIR, 3 for GPINTEN, 4 for GPPU.
 */
 int busInit() {
     bus.frequency(400000);
-    uint8_t IOCON_cfg = 0xC0;
-    uint8_t FF_cfg = 0xff;
-    uint8_t INTCON_cfg = 0x00;
+    uint8_t IOCON_cfg = 0x40;
+    uint8_t IODIR_cfg = 0x7F;
+    uint8_t GPINTEN_cfg = 0x7F;
+    uint8_t GPPU_cfg = 0x7F;
+
     for (uint8_t addr = 0; addr < 4; addr++) { //write config to each I2C slave
         debug(("Writing config to slave %i\n", addr));
-        if (writeReg(addr, 0x0A, &IOCON_cfg)) { //IOCON reg, IOCON.BANK at POR is 0, initial IOCON reg is 0x0A, moves to 0x05 after IOCON cfg 
+        if (writeReg(addr, 0x0A, &IOCON_cfg)) { //IOCON reg
             debug(("IOCON write failed!\n"));
             return -1;
-        } else if (writeReg(addr, 0x06, &FF_cfg) || //GPPUA reg
-                    writeReg(addr, 0x16, &FF_cfg) || //GPPUB reg
-                    writeReg(addr, 0x02, &FF_cfg) || //GPINTENA reg
-                    writeReg(addr, 0x12, &FF_cfg)) { //GPINTENB reg
-            debug(("GPPU/GPINTEN write failed!\n"));
+        } else if (writeReg(addr, 0x00, &IODIR_cfg) ||
+                    writeReg(addr, 0x01, &IODIR_cfg)) { //IODIR A/B
+            debug(("IODIR write failed!\n"));
             return -2;
-        } else if (writeReg(addr, 0x04, &INTCON_cfg) || //INTCONA reg
-                    writeReg(addr, 0x14, &INTCON_cfg)) { //INTCONB reg
-            debug(("INTCON write failed!\n"));
+        } else if (writeReg(addr, 0x04, &GPINTEN_cfg) ||
+                    writeReg(addr, 0x05, &GPINTEN_cfg)) { //GPINTEN A/B
+            debug(("GPINTEN write failed!\n"));
             return -3;
+        } else if (writeReg(addr, 0x0C, &GPPU_cfg) ||
+                    writeReg(addr, 0x0D, &GPPU_cfg)) { //GPPU A/B
+            debug(("GPPU write failed!\n"));
+            return -4;
         }
     }
     return 0;
@@ -137,25 +139,27 @@ int sendMSC(uint8_t command, uint8_t *data, int datalen) {
 
 void reportRegisterStatus() {
     uint8_t rbuf;
-    readReg(0x00, 0x02, &rbuf);
+    readReg(0x01, 0x0A, &rbuf);
+    debug(("IOCON=%x | ", rbuf));
+    readReg(0x01, 0x00, &rbuf);
+    debug(("IODIRA=%x | ", rbuf));
+    readReg(0x01, 0x01, &rbuf);
+    debug(("IODIRB=%x | ", rbuf));
+    readReg(0x01, 0x04, &rbuf);
     debug(("GPINTENA=%x | ", rbuf));
-    readReg(0x00, 0x12, &rbuf);
+    readReg(0x01, 0x05, &rbuf);
     debug(("GPINTENB=%x | ", rbuf));
-    readReg(0x00, 0x04, &rbuf);
+    readReg(0x01, 0x08, &rbuf);
     debug(("INTCONA=%x | ", rbuf));
-    readReg(0x00, 0x14, &rbuf);
+    readReg(0x01, 0x09, &rbuf);
     debug(("INTCONB=%x | ", rbuf));
-    readReg(0x00, 0x05, &rbuf);
-    debug(("IOCON=%x | ", rbuf));
-    readReg(0x00, 0x15, &rbuf);
-    debug(("IOCON=%x | ", rbuf));
-    readReg(0x00, 0x06, &rbuf);
+    readReg(0x01, 0x0C, &rbuf);
     debug(("GPPUA=%x | ", rbuf));
-    readReg(0x00, 0x16, &rbuf);
+    readReg(0x01, 0x0D, &rbuf);
     debug(("GPPUB=%x | ", rbuf));
-    readReg(0x00, 0x09, &rbuf);
+    readReg(0x01, 0x12, &rbuf);
     debug(("GPIOA=%x | ", rbuf));
-    readReg(0x00, 0x19, &rbuf);
+    readReg(0x01, 0x13, &rbuf);
     debug(("GPIOB=%x | ", rbuf));
     if (INT_0) {
         debug(("INT HIGH\n"));
@@ -176,6 +180,7 @@ int main()
     //double faderval[15] = { }; //init fader values at 0
     while (true) {
         if (VERBOSE) {reportRegisterStatus();}
+        wait_us(1000000);
         // for (uint8_t mux_addr = 0; mux_addr < 15; ++mux_addr) { //iterate over fader address (0-15)
         //     MUX_0 = mux_addr & 0x01; //send on A0-A3 pins, set mux switch to given address
         //     MUX_1 = mux_addr & 0x02;
