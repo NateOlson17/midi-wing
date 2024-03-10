@@ -3,7 +3,7 @@
 #include "usbcore.h"
 
 #define DEBUG 1 //ENABLE/DISABLE DEBUG OVER SERIAL - PRINTF IS ALIASED, WILL BLOCK UNTIL COM PORT IS AVAILABLE. TURN OFF DEBUG WHEN RUNNING WITHOUT COM!
-#define VERBOSE 1 //Disabling debug will override verbose option
+#define VERBOSE 0 //Disabling debug will override verbose option
 
 #if DEBUG 
   #define debug(a) printf a
@@ -28,6 +28,7 @@ I2C bus(p28, p27);
 USBMIDI midicon;
 
 
+//make gpio pins reflect opposite of input value so that pressed buttons are 1, verify this when checking INTF and INTCAP as well
 //Get interrupts functional
 //Set up battery harness for LEDs
 //Implement sendMSC properly
@@ -47,7 +48,7 @@ int readReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
         if (bus.write(reg) == 1) { //if register address ack, restart and send next control byte
             bus.start();
             if (bus.write(opcode | 1) == 1) {//send second control byte (opcode with read bit high)
-                *buf = bus.read(0); //read reg into buf and send ack
+                *buf = bus.read(0); //read reg into buf and send nack
                 bus.stop();
                 return 0;
             } else {bus.stop(); return -3;}
@@ -77,7 +78,7 @@ int writeReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
 /*
 Init I2C network.
 Configures:
--All pins as inputs (except GPA7/GPB7, in datasheet errata they are output only on MCP23017, bidirectional on MCP23S17!)
+-All pins as inputs (except GPA7/GPB7, in datasheet errata they are output only on MCP23017 after 2022, bidirectional on MCP23S17!)
 -Pin logic state to match input
 -All pins enabled for interrupt on change (except GPA7/GPB7)
 -Interrupt comparison to previous value, not DEFVAL
@@ -133,38 +134,69 @@ int sendMSC(uint8_t command, uint8_t *data, int datalen) {
     uint8_t msc_close = 0xF7; //closing octet
     memcpy(msc_packet + 6 + datalen, &msc_close, 1);
     
+    debug(("Sending MSC packet => "));
+    for (int i = 0; i < 7 + datalen; ++datalen) {
+        debug(("%i ", msc_packet[i]));
+    }
+    debug(("\n"));
     ep_write(EP5, msc_packet, 7 + datalen);
     return 0;
 }
 
+//Reads and prints MCP23017 register values of interest for debug purposes.
 void reportRegisterStatus() {
     uint8_t rbuf;
-    readReg(0x01, 0x0A, &rbuf);
+    readReg(0x00, 0x0A, &rbuf);
     debug(("IOCON=%x | ", rbuf));
-    readReg(0x01, 0x00, &rbuf);
+    readReg(0x00, 0x00, &rbuf);
     debug(("IODIRA=%x | ", rbuf));
-    readReg(0x01, 0x01, &rbuf);
+    readReg(0x00, 0x01, &rbuf);
     debug(("IODIRB=%x | ", rbuf));
-    readReg(0x01, 0x04, &rbuf);
+    readReg(0x00, 0x04, &rbuf);
     debug(("GPINTENA=%x | ", rbuf));
-    readReg(0x01, 0x05, &rbuf);
+    readReg(0x00, 0x05, &rbuf);
     debug(("GPINTENB=%x | ", rbuf));
-    readReg(0x01, 0x08, &rbuf);
+    readReg(0x00, 0x08, &rbuf);
     debug(("INTCONA=%x | ", rbuf));
-    readReg(0x01, 0x09, &rbuf);
+    readReg(0x00, 0x09, &rbuf);
     debug(("INTCONB=%x | ", rbuf));
-    readReg(0x01, 0x0C, &rbuf);
+    readReg(0x00, 0x0C, &rbuf);
     debug(("GPPUA=%x | ", rbuf));
-    readReg(0x01, 0x0D, &rbuf);
+    readReg(0x00, 0x0D, &rbuf);
     debug(("GPPUB=%x | ", rbuf));
-    readReg(0x01, 0x12, &rbuf);
+    readReg(0x00, 0x12, &rbuf);
     debug(("GPIOA=%x | ", rbuf));
-    readReg(0x01, 0x13, &rbuf);
+    readReg(0x00, 0x13, &rbuf);
     debug(("GPIOB=%x | ", rbuf));
+    readReg(0x00, 0x0E, &rbuf);
+    debug(("INTFA=%x | ", rbuf));
+    readReg(0x00, 0x0F, &rbuf);
+    debug(("INTFB=%x | ", rbuf));
     if (INT_0) {
         debug(("INT HIGH\n"));
     } else {
         debug(("INT LOW\n"));
+    }
+}
+
+int MCPIntHandler(uint8_t dev_addr) {
+    uint8_t regkey = 0x01;
+    //read in both intf regs and read in intcap for intf registers that are nonzero
+    // for (int i = 0; i < 8; ++i, regkey << 1) {
+    //     if (INTFA is nonzero && INTFA & regkey) {
+    //         //i IS THE INDEX OF A HIGH INTFA BIT, GET INTCAPA[i] to determine pin value at time of interrupt
+    //     }
+    //     if (INTFB is nonzero && INTFB & regkey) {
+    //         //i IS THE INDEX OF A HIGH INTFB BIT, GET INTCAPB[i] to determine pin value at time of interrupt
+    //     }
+    // }
+    //as INTF high bit is found, locate corresponding bit in INTCAP and send MSC with value of that bit.
+    if (VERBOSE) {
+        uint8_t rbuf;
+        readReg(dev_addr, 0x10, &rbuf);
+        debug(("INTCAPA-0=%x | ", rbuf));
+        readReg(dev_addr, 0x11, &rbuf);
+        debug(("INTCAPB-0=%x\n", rbuf));
     }
 }
 
@@ -177,24 +209,28 @@ int main()
         debug(("I2C bus init success!\n"));
     }
 
-    //double faderval[15] = { }; //init fader values at 0
+    double faderval[15] = { }; //init fader values at 0
     while (true) {
         if (VERBOSE) {reportRegisterStatus();}
-        wait_us(1000000);
-        // for (uint8_t mux_addr = 0; mux_addr < 15; ++mux_addr) { //iterate over fader address (0-15)
-        //     MUX_0 = mux_addr & 0x01; //send on A0-A3 pins, set mux switch to given address
-        //     MUX_1 = mux_addr & 0x02;
-        //     MUX_2 = mux_addr & 0x04;
-        //     MUX_3 = mux_addr & 0x08;
-        //     double newfaderval = FADER_IN.read() * 100;
-        //     if (abs(newfaderval - faderval[mux_addr]) > .3) { //if current val differs from prev by more than .3%, update
-        //         faderval[mux_addr] = newfaderval;
-        //         uint8_t fader_coarse = newfaderval * 1.28; //get discrete 8 bit values
-        //         uint8_t fader_fine = (newfaderval - trunc(newfaderval)) * 128;
-        //         //printf("[A] %x [C] %i [F] %i\n", mux_addr, fader_coarse, fader_fine);
-        //         //uint8_t mscmsg[] = {mux_addr, 1, fader_fine, fader_coarse}; //fader num, page num, fine, coarse
-        //         //sendMSC(0x06, mscmsg, 4);
-        //     }
-        // }
+
+        for (uint8_t mux_addr = 0; mux_addr < 15; ++mux_addr) { //iterate over fader address (0-15)
+            MUX_0 = mux_addr & 0x01; //send on A0-A3 pins, set mux switch to given address
+            MUX_1 = mux_addr & 0x02;
+            MUX_2 = mux_addr & 0x04;
+            MUX_3 = mux_addr & 0x08;
+            double newfaderval = FADER_IN.read() * 100;
+            if (abs(newfaderval - faderval[mux_addr]) > .3) { //if current val differs from prev by more than .3%, update
+                faderval[mux_addr] = newfaderval;
+                uint8_t fader_coarse = newfaderval * 1.28; //get discrete 8 bit values
+                uint8_t fader_fine = (newfaderval - trunc(newfaderval)) * 128;
+                if(VERBOSE) {debug(("Fader update: [A] %x [C] %i [F] %i\n", mux_addr, fader_coarse, fader_fine));}
+                uint8_t mscmsg[] = {mux_addr, 1, fader_fine, fader_coarse}; //fader num, page num, fine, coarse
+                //sendMSC(0x06, mscmsg, 4);
+            }
+        }
+
+        if (!INT_0) {
+            MCPIntHandler(0);
+        }
     }
 }
