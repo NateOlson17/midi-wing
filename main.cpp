@@ -1,9 +1,10 @@
 #include "mbed.h"
 #include "USBMIDI.h"
 #include "usbcore.h"
+#include <vector>
 
 #define DEBUG 1 //ENABLE/DISABLE DEBUG OVER SERIAL - PRINTF IS ALIASED, WILL BLOCK UNTIL COM PORT IS AVAILABLE. TURN OFF DEBUG WHEN RUNNING WITHOUT COM!
-#define VERBOSE 0 //Disabling debug will override verbose option
+#define VERBOSE 1 //Disabling debug will override verbose option
 
 #if DEBUG 
   #define debug(a) printf a
@@ -27,14 +28,10 @@ I2C bus(p28, p27);
 
 USBMIDI midicon;
 
-
-//make gpio pins reflect opposite of input value so that pressed buttons are 1, verify this when checking INTF and INTCAP as well
-//Get interrupts functional
+//change to HID
 //Set up battery harness for LEDs
 //Implement sendMSC properly
 //Figure out better fader change detection
-
-
 
 /*
 Takes device address, register to read, buffer to store value in.
@@ -79,7 +76,7 @@ int writeReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
 Init I2C network.
 Configures:
 -All pins as inputs (except GPA7/GPB7, in datasheet errata they are output only on MCP23017 after 2022, bidirectional on MCP23S17!)
--Pin logic state to match input
+-Pin logic state opposite input level
 -All pins enabled for interrupt on change (except GPA7/GPB7)
 -Interrupt comparison to previous value, not DEFVAL
 -Non-banked addressing
@@ -88,14 +85,15 @@ Configures:
 -INT as active driver output
 -Interrupts as active LOW
 -100k pull up resistors enabled on all pins (except GPA7/GPB7)
-Returns 0 on success, -n on write fail. n = 1 for IOCON, 2 for IODIR, 3 for GPINTEN, 4 for GPPU.
+Returns 0 on success, -n on write fail. n = 1 for IOCON, 2 for IODIR, 3 for IPOL, 4 for GPINTEN, 5 for GPPU.
 */
 int busInit() {
     bus.frequency(400000);
     uint8_t IOCON_cfg = 0x40;
-    uint8_t IODIR_cfg = 0x7F;
-    uint8_t GPINTEN_cfg = 0x7F;
-    uint8_t GPPU_cfg = 0x7F;
+    uint8_t IODIR_cfg = 0x7f;
+    uint8_t GPINTEN_cfg = 0x7f;
+    uint8_t GPPU_cfg = 0x7f;
+    uint8_t IPOL_cfg = 0x7f;
 
     for (uint8_t addr = 0; addr < 4; addr++) { //write config to each I2C slave
         debug(("Writing config to slave %i\n", addr));
@@ -106,15 +104,19 @@ int busInit() {
                     writeReg(addr, 0x01, &IODIR_cfg)) { //IODIR A/B
             debug(("IODIR write failed!\n"));
             return -2;
+        } else if (writeReg(addr, 0x02, &IPOL_cfg) ||
+                    writeReg(addr, 0x03, &IPOL_cfg)) { //IPOL A/B
+            debug(("IPOL write failed!\n"));
+            return -3;
         } else if (writeReg(addr, 0x04, &GPINTEN_cfg) ||
                     writeReg(addr, 0x05, &GPINTEN_cfg)) { //GPINTEN A/B
             debug(("GPINTEN write failed!\n"));
-            return -3;
+            return -4;
         } else if (writeReg(addr, 0x0C, &GPPU_cfg) ||
                     writeReg(addr, 0x0D, &GPPU_cfg)) { //GPPU A/B
             debug(("GPPU write failed!\n"));
-            return -4;
-        }
+            return -5;
+        } 
     }
     return 0;
 }
@@ -134,11 +136,13 @@ int sendMSC(uint8_t command, uint8_t *data, int datalen) {
     uint8_t msc_close = 0xF7; //closing octet
     memcpy(msc_packet + 6 + datalen, &msc_close, 1);
     
-    debug(("Sending MSC packet => "));
-    for (int i = 0; i < 7 + datalen; ++datalen) {
-        debug(("%i ", msc_packet[i]));
+    if (VERBOSE) {
+        debug(("Sending MSC packet => "));
+        for (int i = 0; i < 7 + datalen; ++i) {
+            debug(("%x ", msc_packet[i]));
+        }
+        debug(("\n"));
     }
-    debug(("\n"));
     ep_write(EP5, msc_packet, 7 + datalen);
     return 0;
 }
@@ -179,25 +183,43 @@ void reportRegisterStatus() {
     }
 }
 
+/*
+Takes MCP23017 device address.
+Reads interrupt flags on given IC and finds value of corresponding key. Will handle multiple simultaneous/waiting interrupt flags.
+Returns 0 on success. 
+*/
 int MCPIntHandler(uint8_t dev_addr) {
-    uint8_t regkey = 0x01;
-    //read in both intf regs and read in intcap for intf registers that are nonzero
-    // for (int i = 0; i < 8; ++i, regkey << 1) {
-    //     if (INTFA is nonzero && INTFA & regkey) {
-    //         //i IS THE INDEX OF A HIGH INTFA BIT, GET INTCAPA[i] to determine pin value at time of interrupt
-    //     }
-    //     if (INTFB is nonzero && INTFB & regkey) {
-    //         //i IS THE INDEX OF A HIGH INTFB BIT, GET INTCAPB[i] to determine pin value at time of interrupt
-    //     }
-    // }
-    //as INTF high bit is found, locate corresponding bit in INTCAP and send MSC with value of that bit.
-    if (VERBOSE) {
-        uint8_t rbuf;
-        readReg(dev_addr, 0x10, &rbuf);
-        debug(("INTCAPA-0=%x | ", rbuf));
-        readReg(dev_addr, 0x11, &rbuf);
-        debug(("INTCAPB-0=%x\n", rbuf));
+    uint8_t intfa_buf;
+    uint8_t intfb_buf;
+    uint8_t intcapa_buf = 0;
+    uint8_t intcapb_buf = 0; 
+    readReg(dev_addr, 0x0E, &intfa_buf); //fetch INTF registers
+    readReg(dev_addr, 0x0F, &intfb_buf);
+    if (intfa_buf) {readReg(dev_addr, 0x10, &intcapa_buf);} //fetch INTCAP registers for nonzero INTF banks
+    if (intfb_buf) {readReg(dev_addr, 0x11, &intcapb_buf);}
+
+    vector<uint8_t> intaflags;
+    vector<uint8_t> intavals;
+    vector<uint8_t> intbflags;
+    vector<uint8_t> intbvals;
+    for (int i = 0; i < 5; ++i) { //iterate through active bits of flag bytes
+        if (intfa_buf && intfa_buf & (1 << i)) { //if nonzero flag byte and current bit is set
+            intaflags.push_back(i); //add index of flagged bit to vector
+            intavals.push_back((intcapa_buf & (1 << i)) ? 1:0); //find value of flagged input and add to value vector
+        }
+        if (intfb_buf && intfb_buf & (1 << i)) { //if nonzero flag byte and current bit is set
+            intaflags.push_back(i); //add index of flagged bit to vector
+            intbvals.push_back((intcapb_buf & (1 << i)) ? 1:0); //find value of flagged input and add to value vector
+        }
     }
+
+    for (unsigned int i = 0; i < intaflags.size(); ++i) {
+        debug(("INTERRUPT: BTN A%i BANK %i AT %i\n", intaflags[i], dev_addr, intavals[i]));
+    }
+    for (unsigned int i = 0; i < intbflags.size(); ++i) {
+        debug(("INTERRUPT: BTN B%i BANK %i AT %i\n", intbflags[i], dev_addr, intbvals[i]));
+    }
+    return 0;
 }
 
 int main()
@@ -223,14 +245,15 @@ int main()
                 faderval[mux_addr] = newfaderval;
                 uint8_t fader_coarse = newfaderval * 1.28; //get discrete 8 bit values
                 uint8_t fader_fine = (newfaderval - trunc(newfaderval)) * 128;
-                if(VERBOSE) {debug(("Fader update: [A] %x [C] %i [F] %i\n", mux_addr, fader_coarse, fader_fine));}
+                debug(("Fader update: [A] %x [C] %i [F] %i\n", mux_addr, fader_coarse, fader_fine));
                 uint8_t mscmsg[] = {mux_addr, 1, fader_fine, fader_coarse}; //fader num, page num, fine, coarse
-                //sendMSC(0x06, mscmsg, 4);
+                sendMSC(0x06, mscmsg, 4);
             }
         }
 
-        if (!INT_0) {
-            MCPIntHandler(0);
-        }
+        if (!INT_0) {MCPIntHandler(0);}
+        if (!INT_1) {MCPIntHandler(1);}
+        if (!INT_2) {MCPIntHandler(2);}
+        if (!INT_3) {MCPIntHandler(3);}
     }
 }
