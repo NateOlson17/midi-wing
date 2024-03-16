@@ -1,7 +1,6 @@
 #include "mbed.h"
-#include "USBMIDI.h"
-#include "usbcore.h"
 #include <vector>
+#include "USBMIDI.h"
 
 #define DEBUG 1 //ENABLE/DISABLE DEBUG OVER SERIAL - PRINTF IS ALIASED, WILL BLOCK UNTIL COM PORT IS AVAILABLE. TURN OFF DEBUG WHEN RUNNING WITHOUT COM!
 #define VERBOSE 1 //Disabling debug will override verbose option
@@ -26,7 +25,8 @@ AnalogIn FADER_IN(p20, 3.3);
 
 I2C bus(p28, p27);
 
-USBMIDI midicon;
+USBMIDI usb_con;
+
 
 //change to HID
 //Set up battery harness for LEDs
@@ -73,8 +73,8 @@ int writeReg(uint8_t addr, uint8_t reg, uint8_t *buf) {
 
 
 /*
-Init I2C network.
-Configures:
+Init/config I2C devices and USB HID.
+MCP23017 configuration:
 -All pins as inputs (except GPA7/GPB7, in datasheet errata they are output only on MCP23017 after 2022, bidirectional on MCP23S17!)
 -Pin logic state opposite input level
 -All pins enabled for interrupt on change (except GPA7/GPB7)
@@ -85,11 +85,19 @@ Configures:
 -INT as active driver output
 -Interrupts as active LOW
 -100k pull up resistors enabled on all pins (except GPA7/GPB7)
-Returns 0 on success, -n on write fail. n = 1 for IOCON, 2 for IODIR, 3 for IPOL, 4 for GPINTEN, 5 for GPPU.
+Returns 0 on success, -n on write fail. n = 1 for IOCON, 2 for IODIR, 3 for IPOL, 4 for GPINTEN, 5 for GPPU. -6 for USB init fail.
 */
 int busInit() {
-    bus.frequency(400000);
-    uint8_t IOCON_cfg = 0x40;
+    usb_con.init();
+    if (usb_con.ready()) {
+        debug(("USB config success!\n"));
+    } else {
+        debug(("USB config failed!\n"));
+        return -6;
+    }
+
+    bus.frequency(400000); //I2C bus
+    uint8_t IOCON_cfg = 0x40; //MCP register configs
     uint8_t IODIR_cfg = 0x7f;
     uint8_t GPINTEN_cfg = 0x7f;
     uint8_t GPPU_cfg = 0x7f;
@@ -126,15 +134,16 @@ Takes command byte (0x06 for set), data pointer, and data length.
 Sends a formatted MSC message over serial.
 Returns 0 on success.
 */
-int sendMSC(uint8_t command, uint8_t *data, int datalen) {
-    uint8_t msc_packet[] = {0xF0, 0x7F, 0x7F, 0x02, 0x7F, command};
+int sendMSC(uint8_t command, uint8_t *mscdata, int datalen) {
+    vector<uint8_t> msc_packet{0xF0, 0x7F, 0x7F, 0x02, 0x7F, command};
     /*[F07F] header, marks univ sys ex/realtime
       [7F] target device (broadcast)
       [02] MSC specifier
       [7F] command format (all)*/
-    memcpy(msc_packet + 6, data, datalen); //copy data to end of msc packet
-    uint8_t msc_close = 0xF7; //closing octet
-    memcpy(msc_packet + 6 + datalen, &msc_close, 1);
+    for (int i = 0; i < datalen; ++i) {
+        msc_packet.push_back(mscdata[i]);
+    }
+    msc_packet.push_back(0xF7); //closing octet
     
     if (VERBOSE) {
         debug(("Sending MSC packet => "));
@@ -143,7 +152,7 @@ int sendMSC(uint8_t command, uint8_t *data, int datalen) {
         }
         debug(("\n"));
     }
-    ep_write(EP5, msc_packet, 7 + datalen);
+    usb_con.write(MIDIMessage::SysEx(&msc_packet.front(), 7 + datalen));
     return 0;
 }
 
@@ -185,7 +194,7 @@ void reportRegisterStatus() {
 
 /*
 Takes MCP23017 device address.
-Reads interrupt flags on given IC and finds value of corresponding key. Will handle multiple simultaneous/waiting interrupt flags.
+Reads interrupt flags on given IC and finds value of corresponding key. For future-proofing, supports detection of multiple simultaneous/waiting interrupt flags, although MCP23017 flags one port exclusively.
 Returns 0 on success. 
 */
 int MCPIntHandler(uint8_t dev_addr) {
